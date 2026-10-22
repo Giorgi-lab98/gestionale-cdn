@@ -1,0 +1,5 @@
+streamlit
+pandas
+pdfplumber
+openpyxl
+psycopg2-binary
