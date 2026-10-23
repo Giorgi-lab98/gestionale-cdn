@@ -441,6 +441,55 @@ def carica_tariffe_prestazioni():
         conn.close()
 
 
+def carica_fatturazione(anno=None, mese=None, stato_fatturazione=None, stato_pagamento=None, cliente=None):
+    conn = get_connection()
+    query = """
+        SELECT
+            ip.id_intervento_programmato AS id,
+            c.nome_cliente               AS cliente,
+            s.nome_sede                  AS sede,
+            s.indirizzo                  AS indirizzo,
+            ip.anno                      AS anno,
+            ip.mese                      AS mese_numero,
+            CASE ip.mese
+                WHEN 1 THEN 'Gennaio'  WHEN 2 THEN 'Febbraio' WHEN 3 THEN 'Marzo'
+                WHEN 4 THEN 'Aprile'   WHEN 5 THEN 'Maggio'   WHEN 6 THEN 'Giugno'
+                WHEN 7 THEN 'Luglio'   WHEN 8 THEN 'Agosto'   WHEN 9 THEN 'Settembre'
+                WHEN 10 THEN 'Ottobre' WHEN 11 THEN 'Novembre' WHEN 12 THEN 'Dicembre'
+            END                          AS mese,
+            p.nome_prestazione           AS prestazione,
+            ip.stato                     AS stato_intervento,
+            ip.costo_unitario            AS costo_unitario,
+            ip.costo_totale              AS costo_totale,
+            COALESCE(ip.stato_fatturazione,'da_fatturare') AS stato_fatturazione,
+            COALESCE(ip.stato_pagamento,'non_pagato')      AS stato_pagamento,
+            ip.numero_fattura            AS numero_fattura,
+            ip.data_pagamento            AS data_pagamento,
+            ip.note_fatturazione         AS note_fatturazione
+        FROM interventi_programmati ip
+        JOIN sedi        s ON ip.id_sede              = s.id_sede
+        JOIN clienti     c ON s.id_cliente            = c.id_cliente
+        JOIN prestazioni p ON ip.codice_prestazione   = p.codice_prestazione
+        WHERE ip.stato_fatturazione != 'non_fatturare'
+    """
+    params = []
+    if anno is not None:
+        query += " AND ip.anno = %s"; params.append(anno)
+    if mese is not None:
+        query += " AND ip.mese = %s"; params.append(mese)
+    if stato_fatturazione:
+        query += " AND ip.stato_fatturazione = %s"; params.append(stato_fatturazione)
+    if stato_pagamento:
+        query += " AND ip.stato_pagamento = %s"; params.append(stato_pagamento)
+    if cliente:
+        query += " AND c.nome_cliente = %s"; params.append(cliente)
+    query += " ORDER BY c.nome_cliente, ip.anno, ip.mese"
+    try:
+        return pd.read_sql(query, conn, params=params)
+    finally:
+        conn.close()
+
+
 def contratto_esiste(numero_contratto):
     if not numero_contratto:
         return False
@@ -803,6 +852,7 @@ except Exception as e:
 
 pagina = st.sidebar.radio("Menu", [
     "Dashboard consultazione",
+    "Fatturazione e pagamenti",
     "Caricamento prestazione manuale",
     "Caricamento prestazione da contratto",
 ])
@@ -980,6 +1030,216 @@ if pagina == "Dashboard consultazione":
                             st.rerun()
                         except Exception as e:
                             st.error(str(e))
+
+
+# =========================
+# FATTURAZIONE E PAGAMENTI
+# =========================
+
+if pagina == "Fatturazione e pagamenti":
+    st.subheader("Fatturazione e pagamenti")
+    st.caption("Riepilogo economico per periodo. Aggiorna fattura e pagamento direttamente da questa pagina.")
+
+    clienti_df_fat = carica_clienti()
+    clienti_opzioni_fat = ["Tutti"] + (
+        sorted(clienti_df_fat["nome_cliente"].dropna().astype(str).unique().tolist())
+        if not clienti_df_fat.empty else []
+    )
+
+    # ── FILTRI ──────────────────────────────────────────────────────────────
+    with st.container(border=True):
+        st.markdown("#### Filtri")
+        c1, c2, c3, c4, c5 = st.columns([1, 1, 1.3, 1.3, 1.8])
+        with c1:
+            anno_f = ANNI_LABEL[st.selectbox("Anno", list(ANNI_LABEL.keys()), key="fat_anno")]
+        with c2:
+            mese_f = MESI_LABEL[st.selectbox("Mese", list(MESI_LABEL.keys()), key="fat_mese")]
+        with c3:
+            sf_opzioni = {"Tutti": None, "Da fatturare": "da_fatturare", "Fatturato": "fatturato"}
+            sf_label   = st.selectbox("Stato fatturazione", list(sf_opzioni.keys()), key="fat_sf")
+            sf_f       = sf_opzioni[sf_label]
+        with c4:
+            sp_opzioni = {"Tutti": None, "Non pagato": "non_pagato", "Pagato": "pagato", "Parziale": "parziale"}
+            sp_label   = st.selectbox("Stato pagamento", list(sp_opzioni.keys()), key="fat_sp")
+            sp_f       = sp_opzioni[sp_label]
+        with c5:
+            cliente_f_label = st.selectbox("Cliente", clienti_opzioni_fat, index=0, key="fat_cliente")
+            cliente_f       = None if cliente_f_label == "Tutti" else cliente_f_label
+
+    df_fat = carica_fatturazione(
+        anno=anno_f, mese=mese_f,
+        stato_fatturazione=sf_f, stato_pagamento=sp_f,
+        cliente=cliente_f,
+    )
+
+    if df_fat.empty:
+        st.info("Nessun intervento trovato con i filtri selezionati.")
+    else:
+        # ── KPI ─────────────────────────────────────────────────────────────
+        da_fatturare   = df_fat[df_fat["stato_fatturazione"] == "da_fatturare"]["costo_totale"].sum()
+        fatturato_np   = df_fat[(df_fat["stato_fatturazione"] == "fatturato") &
+                                (df_fat["stato_pagamento"]    == "non_pagato")]["costo_totale"].sum()
+        incassato      = df_fat[df_fat["stato_pagamento"] == "pagato"]["costo_totale"].sum()
+        parziale       = df_fat[df_fat["stato_pagamento"] == "parziale"]["costo_totale"].sum()
+
+        k1, k2, k3, k4 = st.columns(4)
+        with k1:
+            st.metric("Da fatturare", f"€ {da_fatturare:,.2f}".replace(",", "."))
+        with k2:
+            st.metric("Fatturato non pagato", f"€ {fatturato_np:,.2f}".replace(",", "."))
+        with k3:
+            st.metric("Incassato", f"€ {incassato:,.2f}".replace(",", "."))
+        with k4:
+            st.metric("Parzialmente pagato", f"€ {parziale:,.2f}".replace(",", "."))
+
+        st.markdown("---")
+
+        # ── RIEPILOGO PER CLIENTE ────────────────────────────────────────────
+        with st.container(border=True):
+            st.markdown("#### Riepilogo per cliente")
+
+            riepilogo = df_fat.groupby("cliente").agg(
+                interventi        = ("id", "count"),
+                totale            = ("costo_totale", "sum"),
+                da_fatturare      = ("costo_totale", lambda x: x[df_fat.loc[x.index, "stato_fatturazione"] == "da_fatturare"].sum()),
+                fatturato_np      = ("costo_totale", lambda x: x[
+                    (df_fat.loc[x.index, "stato_fatturazione"] == "fatturato") &
+                    (df_fat.loc[x.index, "stato_pagamento"]    == "non_pagato")
+                ].sum()),
+                incassato         = ("costo_totale", lambda x: x[df_fat.loc[x.index, "stato_pagamento"] == "pagato"].sum()),
+            ).reset_index()
+
+            riepilogo.columns = ["Cliente", "N. interventi", "Totale €", "Da fatturare €", "Fatturato non pagato €", "Incassato €"]
+
+            st.dataframe(
+                riepilogo,
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "Totale €":               st.column_config.NumberColumn(format="€ %.2f"),
+                    "Da fatturare €":         st.column_config.NumberColumn(format="€ %.2f"),
+                    "Fatturato non pagato €": st.column_config.NumberColumn(format="€ %.2f"),
+                    "Incassato €":            st.column_config.NumberColumn(format="€ %.2f"),
+                }
+            )
+
+        # ── DETTAGLIO INTERVENTI ─────────────────────────────────────────────
+        st.markdown("---")
+        with st.container(border=True):
+            st.markdown("#### Dettaglio interventi")
+
+            df_vis_fat = df_fat.drop(columns=["mese_numero"], errors="ignore").reset_index(drop=True)
+
+            st.dataframe(
+                df_vis_fat,
+                use_container_width=True,
+                height=360,
+                hide_index=True,
+                column_config={
+                    "id":              None,
+                    "costo_unitario":  st.column_config.NumberColumn("Costo unitario", format="€ %.2f"),
+                    "costo_totale":    st.column_config.NumberColumn("Costo totale",   format="€ %.2f"),
+                    "data_pagamento":  st.column_config.DateColumn("Data pagamento", format="DD/MM/YYYY"),
+                }
+            )
+
+        # ── EXPORT EXCEL ─────────────────────────────────────────────────────
+        st.markdown("---")
+        with st.container(border=True):
+            st.markdown("#### Export")
+            st.caption("Scarica il dettaglio come file Excel per il commercialista o per riconciliazioni.")
+
+            import io
+            buffer = io.BytesIO()
+            with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+                df_vis_fat.to_excel(writer, index=False, sheet_name="Fatturazione")
+                riepilogo.to_excel(writer, index=False, sheet_name="Riepilogo per cliente")
+            buffer.seek(0)
+
+            periodo = f"{anno_f or 'tutti'}_{mese_f or 'tutti'}"
+            st.download_button(
+                label="📥 Scarica Excel",
+                data=buffer,
+                file_name=f"fatturazione_cdn_{periodo}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+
+        # ── AGGIORNA FATTURA / PAGAMENTO ─────────────────────────────────────
+        st.markdown("---")
+        st.subheader("Aggiorna fattura / pagamento")
+        st.caption("Seleziona un intervento dalla lista e aggiorna lo stato amministrativo.")
+
+        with st.container(border=True):
+            clienti_det = sorted(df_vis_fat["cliente"].dropna().astype(str).unique().tolist())
+            ca, cb = st.columns([1.4, 1])
+            with ca:
+                cliente_det = st.selectbox("Cliente", clienti_det, key="fat_det_cliente")
+            df_cli_det = df_vis_fat[df_vis_fat["cliente"].astype(str) == str(cliente_det)].copy()
+            mesi_det   = sorted(df_cli_det["mese"].dropna().astype(str).unique().tolist())
+            with cb:
+                mese_det = st.selectbox("Mese", mesi_det, key="fat_det_mese")
+
+            df_int_det = df_cli_det[df_cli_det["mese"].astype(str) == str(mese_det)].copy()
+            opzioni_det, mappa_det = [], {}
+            for _, r in df_int_det.iterrows():
+                label = (f"{r.get('sede','')} | {r['prestazione']} | "
+                         f"Fattura: {r['stato_fatturazione']} | Pagamento: {r['stato_pagamento']} | ID {r['id']}")
+                opzioni_det.append(label)
+                mappa_det[label] = r
+
+            if opzioni_det:
+                sel_label = st.selectbox("Intervento", opzioni_det, key="fat_det_intervento")
+                riga_det  = mappa_det[sel_label]
+                id_int_det = int(riga_det["id"])
+
+                sf_corr = str(riga_det.get("stato_fatturazione") or "da_fatturare")
+                sp_corr = str(riga_det.get("stato_pagamento")    or "non_pagato")
+
+                c1, c2 = st.columns(2)
+                with c1:
+                    opts_f = ["da_fatturare", "fatturato", "non_fatturare"]
+                    sf_det = st.selectbox("Stato fatturazione", opts_f,
+                        index=opts_f.index(sf_corr) if sf_corr in opts_f else 0,
+                        key=f"fat_sf_det_{id_int_det}")
+                    nf_det = st.text_input("Numero fattura",
+                        value="" if pd.isna(riga_det.get("numero_fattura")) else str(riga_det.get("numero_fattura") or ""),
+                        disabled=sf_det != "fatturato",
+                        key=f"fat_nf_det_{id_int_det}")
+                with c2:
+                    opts_p = ["non_pagato", "pagato", "parziale", "non_dovuto"]
+                    sp_det = st.selectbox("Stato pagamento", opts_p,
+                        index=opts_p.index(sp_corr) if sp_corr in opts_p else 0,
+                        key=f"fat_sp_det_{id_int_det}")
+                    dp_det = None
+                    if sp_det in ["pagato", "parziale"]:
+                        dp_corr = riga_det.get("data_pagamento")
+                        if pd.isna(dp_corr) or dp_corr is None:
+                            dp_corr = date.today()
+                        dp_det = st.date_input("Data pagamento", value=dp_corr,
+                            format="DD/MM/YYYY", key=f"fat_dp_det_{id_int_det}")
+                    else:
+                        st.info("Data pagamento vuota finché non pagato.")
+
+                nf_fat = st.text_area("Note fatturazione",
+                    value="" if pd.isna(riga_det.get("note_fatturazione")) else str(riga_det.get("note_fatturazione") or ""),
+                    key=f"fat_note_det_{id_int_det}")
+
+                if st.button("Salva", key=f"fat_btn_det_{id_int_det}", type="primary"):
+                    try:
+                        if sf_det == "fatturato" and not str(nf_det or "").strip():
+                            st.error("Inserire il numero fattura.")
+                        elif sp_det in ["pagato", "parziale"] and dp_det is None:
+                            st.error("Inserire la data pagamento.")
+                        else:
+                            aggiorna_fatturazione_intervento(
+                                id_int_det, sf_det, sp_det, nf_det,
+                                dp_det if sp_det in ["pagato", "parziale"] else None,
+                                nf_fat,
+                            )
+                            st.success("Aggiornato correttamente.")
+                            st.rerun()
+                    except Exception as e:
+                        st.error(str(e))
 
 
 # =========================
